@@ -20,7 +20,6 @@ import type {
   SyncTransactionReceipt,
 } from "@/types/sync.js";
 import { range } from "@/utils/range.js";
-import type { RequestQueue } from "@/utils/requestQueue.js";
 import {
   _eth_getBlockByHash,
   _eth_getBlockByNumber,
@@ -48,7 +47,6 @@ export type RealtimeSync = {
 type CreateRealtimeSyncParameters = {
   common: Common;
   network: Network;
-  requestQueue: RequestQueue;
   sources: Source[];
   syncStore: SyncStore;
   onEvent: (event: RealtimeSyncEvent) => void;
@@ -342,7 +340,7 @@ export const createRealtimeSync = (
 
       if (localChain.length === 0) break;
       else {
-        remoteBlock = await _eth_getBlockByHash(args.requestQueue, {
+        remoteBlock = await _eth_getBlockByHash(args.network.request, {
           hash: remoteBlock.parentHash,
         });
         // Add tip to `reorgedBlocks`
@@ -380,7 +378,9 @@ export const createRealtimeSync = (
 
     let logs: SyncLog[] = [];
     if (shouldRequestLogs) {
-      logs = await _eth_getLogs(args.requestQueue, { blockHash: block.hash });
+      logs = await _eth_getLogs(args.network.request, {
+        blockHash: block.hash,
+      });
 
       // Protect against RPCs returning empty logs. Known to happen near chain tip.
       if (block.logsBloom !== zeroLogsBloom && logs.length === 0) {
@@ -408,7 +408,7 @@ export const createRealtimeSync = (
 
     let callTraces: SyncCallTrace[] = [];
     if (shouldRequestTraces) {
-      const traces = await _trace_block(args.requestQueue, {
+      const traces = await _trace_block(args.network.request, {
         blockNumber: hexToNumber(block.number),
       });
 
@@ -493,7 +493,7 @@ export const createRealtimeSync = (
     if (shouldRequestTransactionReceipts) {
       transactionReceipts = await Promise.all(
         transactions.map(({ hash }) =>
-          _eth_getTransactionReceipt(args.requestQueue, { hash }),
+          _eth_getTransactionReceipt(args.network.request, { hash }),
         ),
       );
     }
@@ -583,7 +583,7 @@ export const createRealtimeSync = (
               );
               const pendingBlocks = await Promise.all(
                 missingBlockRange.map((blockNumber) =>
-                  _eth_getBlockByNumber(args.requestQueue, {
+                  _eth_getBlockByNumber(args.network.request, {
                     blockNumber,
                   }).then((block) => fetchBlockEventData(block)),
                 ),
@@ -673,7 +673,7 @@ export const createRealtimeSync = (
 
       const enqueue = async () => {
         try {
-          const block = await _eth_getBlockByNumber(args.requestQueue, {
+          const block = await _eth_getBlockByNumber(args.network.request, {
             blockTag: "latest",
           }).then((block) => fetchBlockEventData(block));
 

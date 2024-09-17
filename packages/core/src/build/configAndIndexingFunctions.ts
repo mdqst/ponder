@@ -3,19 +3,15 @@ import { BuildError } from "@/common/errors.js";
 import type { Options } from "@/common/options.js";
 import type { Config } from "@/config/config.js";
 import type { DatabaseConfig } from "@/config/database.js";
-import {
-  type Network,
-  getFinalityBlockCount,
-  getRpcUrlsForClient,
-  isRpcUrlPublic,
-} from "@/config/networks.js";
+import { type Network, getFinalityBlockCount } from "@/config/networks.js";
 import { buildAbiEvents, buildAbiFunctions, buildTopics } from "@/sync/abi.js";
+import { superPonder } from "@/sync/request.js";
 import type { BlockSource, ContractSource } from "@/sync/source.js";
 import { chains } from "@/utils/chains.js";
 import { toLowerCase } from "@/utils/lowercase.js";
 import { dedupe } from "@ponder/common";
 import parse from "pg-connection-string";
-import type { Hex, LogTopic } from "viem";
+import { http, type Hex, type LogTopic, type Transport } from "viem";
 import { buildLogFactory } from "./factory.js";
 
 export type RawIndexingFunctions = {
@@ -176,24 +172,13 @@ export async function buildConfigAndIndexingFunctions({
 
   const networks: Network[] = await Promise.all(
     Object.entries(config.networks).map(async ([networkName, network]) => {
-      const { chainId, transport } = network;
+      const { chainId, rpcUrl } = network;
 
       const defaultChain =
         Object.values(chains).find((c) =>
           "id" in c ? c.id === chainId : false,
         ) ?? chains.mainnet!;
       const chain = { ...defaultChain, name: networkName, id: chainId };
-
-      // Note: This can throw.
-      const rpcUrls = await getRpcUrlsForClient({ transport, chain });
-      rpcUrls.forEach((rpcUrl) => {
-        if (isRpcUrlPublic(rpcUrl)) {
-          logs.push({
-            level: "warn",
-            msg: `Network '${networkName}' is using a public RPC URL (${rpcUrl}). Most apps require an RPC URL with a higher rate limit.`,
-          });
-        }
-      });
 
       if (
         network.pollingInterval !== undefined &&
@@ -204,12 +189,18 @@ export async function buildConfigAndIndexingFunctions({
         );
       }
 
+      let transports: Transport[];
+      if (typeof rpcUrl === "string") {
+        transports = [http(rpcUrl)];
+      } else {
+        transports = rpcUrl.map((url) => http(url));
+      }
+
       return {
         name: networkName,
         chainId,
         chain,
-        transport: network.transport({ chain }),
-        maxRequestsPerSecond: network.maxRequestsPerSecond ?? 50,
+        request: superPonder(transports)({ chain }).request,
         pollingInterval: network.pollingInterval ?? 1_000,
         finalityBlockCount: getFinalityBlockCount({ chainId }),
         disableCache: network.disableCache ?? false,

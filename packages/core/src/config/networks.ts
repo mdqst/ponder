@@ -1,3 +1,4 @@
+import type { Request } from "@/sync/request.js";
 import { chains } from "@/utils/chains.js";
 import type { Chain, Client, Transport } from "viem";
 
@@ -5,9 +6,8 @@ export type Network = {
   name: string;
   chainId: number;
   chain: Chain;
-  transport: ReturnType<Transport>;
+  request: Request;
   pollingInterval: number;
-  maxRequestsPerSecond: number;
   finalityBlockCount: number;
   disableCache: boolean;
 };

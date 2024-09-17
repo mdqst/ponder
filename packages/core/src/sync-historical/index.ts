@@ -20,7 +20,6 @@ import {
   intervalDifference,
 } from "@/utils/interval.js";
 import { never } from "@/utils/never.js";
-import type { RequestQueue } from "@/utils/requestQueue.js";
 import {
   _eth_getBlockByNumber,
   _eth_getLogs,
@@ -53,7 +52,6 @@ type CreateHistoricalSyncParameters = {
   sources: Source[];
   syncStore: SyncStore;
   network: Network;
-  requestQueue: RequestQueue;
 };
 
 export const createHistoricalSync = async (
@@ -151,7 +149,7 @@ export const createHistoricalSync = async (
     const logs = await Promise.all(
       intervals.flatMap((interval) =>
         addressBatches.map((address) =>
-          _eth_getLogs(args.requestQueue, {
+          _eth_getLogs(args.network.request, {
             address,
             topics,
             fromBlock: interval[0],
@@ -246,7 +244,7 @@ export const createHistoricalSync = async (
     if (filter.includeTransactionReceipts) {
       const transactionReceipts = await Promise.all(
         [...transactionHashes].map((hash) =>
-          _eth_getTransactionReceipt(args.requestQueue, { hash }),
+          _eth_getTransactionReceipt(args.network.request, { hash }),
         ),
       );
 
@@ -293,7 +291,7 @@ export const createHistoricalSync = async (
 
     if (isKilled) return;
 
-    let callTraces = await _trace_filter(args.requestQueue, {
+    let callTraces = await _trace_filter(args.network.request, {
       fromAddress: filter.fromAddress,
       toAddress,
       fromBlock: interval[0],
@@ -308,7 +306,7 @@ export const createHistoricalSync = async (
     // Request transactionReceipts to check for reverted transactions.
     const transactionReceipts = await Promise.all(
       dedupe(callTraces.map((t) => t.transactionHash)).map((hash) =>
-        _eth_getTransactionReceipt(args.requestQueue, {
+        _eth_getTransactionReceipt(args.network.request, {
           hash,
         }),
       ),
@@ -386,7 +384,7 @@ export const createHistoricalSync = async (
     if (blockCache.has(number)) {
       block = await blockCache.get(number)!;
     } else {
-      const _block = _eth_getBlockByNumber(args.requestQueue, {
+      const _block = _eth_getBlockByNumber(args.network.request, {
         blockNumber: toHex(number),
       });
       blockCache.set(number, _block);

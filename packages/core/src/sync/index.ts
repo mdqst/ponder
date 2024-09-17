@@ -31,7 +31,6 @@ import {
 } from "@/utils/interval.js";
 import { intervalUnion } from "@/utils/interval.js";
 import { never } from "@/utils/never.js";
-import { type RequestQueue, createRequestQueue } from "@/utils/requestQueue.js";
 import { startClock } from "@/utils/timer.js";
 import { createQueue } from "@ponder/common";
 import { type Transport, hexToBigInt, hexToNumber } from "viem";
@@ -170,7 +169,6 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
   const localSyncContext = new Map<
     Network,
     {
-      requestQueue: RequestQueue;
       syncProgress: SyncProgress;
       historicalSync: HistoricalSync;
       realtimeSync: RealtimeSync;
@@ -182,10 +180,6 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
   // Instantiate `localSyncData` and `status`
   await Promise.all(
     args.networks.map(async (network) => {
-      const requestQueue = createRequestQueue({
-        network,
-        common: args.common,
-      });
       const sources = args.sources.filter(
         ({ filter }) => filter.chainId === network.chainId,
       );
@@ -194,14 +188,12 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
         common: args.common,
         sources,
         syncStore: args.syncStore,
-        requestQueue,
         network,
       });
       const realtimeSync = createRealtimeSync({
         common: args.common,
         sources,
         syncStore: args.syncStore,
-        requestQueue,
         network,
         onEvent: (event) =>
           eventQueue.add({ event, network }).catch((error) => {
@@ -215,15 +207,14 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
         onFatalError: args.onFatalError,
       });
       const cached = await getCachedBlock({
+        network,
         sources,
-        requestQueue,
         historicalSync,
       });
       const syncProgress: SyncProgress = {
         ...(await syncDiagnostic({
           common: args.common,
           sources,
-          requestQueue,
           network,
         })),
         cached,
@@ -231,7 +222,6 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
       };
 
       localSyncContext.set(network, {
-        requestQueue,
         syncProgress,
         historicalSync,
         realtimeSync,
@@ -486,13 +476,13 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
 
       await Promise.all(
         Array.from(localSyncContext.entries()).map(
-          async ([network, { requestQueue, syncProgress }]) => {
+          async ([network, { syncProgress }]) => {
             args.common.logger.debug({
               service: "sync",
               msg: `Refetching '${network.name}' finalized block`,
             });
 
-            const latestBlock = await _eth_getBlockByNumber(requestQueue, {
+            const latestBlock = await _eth_getBlockByNumber(network.request, {
               blockTag: "latest",
             });
 
@@ -501,9 +491,12 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
               hexToNumber(latestBlock.number) - network.finalityBlockCount,
             );
 
-            syncProgress.finalized = await _eth_getBlockByNumber(requestQueue, {
-              blockNumber: finalizedBlockNumber,
-            });
+            syncProgress.finalized = await _eth_getBlockByNumber(
+              network.request,
+              {
+                blockNumber: finalizedBlockNumber,
+              },
+            );
 
             const historicalLast = getHistoricalLast(syncProgress);
 
@@ -706,8 +699,10 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
       return status;
     },
     getCachedTransport(network) {
-      const { requestQueue } = localSyncContext.get(network)!;
-      return cachedTransport({ requestQueue, syncStore: args.syncStore });
+      return cachedTransport({
+        request: network.request,
+        syncStore: args.syncStore,
+      });
     },
     async kill() {
       isKilled = true;
@@ -732,12 +727,10 @@ export const syncDiagnostic = async ({
   common,
   sources,
   network,
-  requestQueue,
 }: {
   common: Common;
   sources: Source[];
   network: Network;
-  requestQueue: RequestQueue;
 }) => {
   /** Earliest `startBlock` among all `filters` */
   const start = Math.min(...sources.map(({ filter }) => filter.fromBlock ?? 0));
@@ -750,12 +743,12 @@ export const syncDiagnostic = async ({
     : Math.min(...sources.map(({ filter }) => filter.toBlock!));
 
   const [remoteChainId, startBlock, endBlock, latestBlock] = await Promise.all([
-    requestQueue.request({ method: "eth_chainId" }),
-    _eth_getBlockByNumber(requestQueue, { blockNumber: start }),
+    network.request({ method: "eth_chainId" }),
+    _eth_getBlockByNumber(network.request, { blockNumber: start }),
     end === undefined
       ? undefined
-      : _eth_getBlockByNumber(requestQueue, { blockNumber: end }),
-    _eth_getBlockByNumber(requestQueue, { blockTag: "latest" }),
+      : _eth_getBlockByNumber(network.request, { blockNumber: end }),
+    _eth_getBlockByNumber(network.request, { blockTag: "latest" }),
   ]);
 
   // Warn if the config has a different chainId than the remote.
@@ -771,7 +764,7 @@ export const syncDiagnostic = async ({
     hexToNumber(latestBlock.number) - network.finalityBlockCount,
   );
 
-  const finalizedBlock = await _eth_getBlockByNumber(requestQueue, {
+  const finalizedBlock = await _eth_getBlockByNumber(network.request, {
     blockNumber: finalizedBlockNumber,
   });
 
@@ -784,12 +777,12 @@ export const syncDiagnostic = async ({
 
 /** Returns the closest-to-tip block that has been synced for all `sources`. */
 export const getCachedBlock = ({
+  network,
   sources,
-  requestQueue,
   historicalSync,
 }: {
+  network: Network;
   sources: Source[];
-  requestQueue: RequestQueue;
   historicalSync: HistoricalSync;
 }): Promise<SyncBlock> | undefined => {
   const latestCompletedBlocks = sources.map(({ filter }) => {
@@ -826,7 +819,7 @@ export const getCachedBlock = ({
         block !== undefined || sources[i]!.filter.fromBlock > minCompletedBlock,
     )
   ) {
-    return _eth_getBlockByNumber(requestQueue, {
+    return _eth_getBlockByNumber(network.request, {
       blockNumber: minCompletedBlock,
     });
   }
