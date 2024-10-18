@@ -41,16 +41,13 @@ export async function buildConfigAndIndexingFunctions({
   // Build database.
   let databaseConfig: DatabaseConfig;
 
-  // Determine PGlite directory, preferring config.database.directory if available
-  const pgliteDir =
-    config.database?.kind === "pglite" && config.database.directory
-      ? config.database.directory === "memory://"
-        ? "memory://"
-        : path.resolve(config.database.directory)
-      : path.join(ponderDir, "pglite");
+  // Determine SQLite directory, preferring config.database.directory if available
+  const sqliteDir =
+    config.database?.kind === "sqlite" && config.database.directory
+      ? path.resolve(config.database.directory)
+      : path.join(ponderDir, "sqlite");
 
-  const pglitePrintPath =
-    pgliteDir === "memory://" ? "memory://" : path.relative(rootDir, pgliteDir);
+  const sqlitePrintPath = path.relative(rootDir, sqliteDir);
 
   if (config.database?.kind) {
     if (config.database.kind === "postgres") {
@@ -114,10 +111,10 @@ export async function buildConfigAndIndexingFunctions({
     } else {
       logs.push({
         level: "info",
-        msg: `Using PGlite database in '${pglitePrintPath}' (from ponder.config.ts)`,
+        msg: `Using SQLite database in '${sqlitePrintPath}' (from ponder.config.ts)`,
       });
 
-      databaseConfig = { kind: "pglite", options: { dataDir: pgliteDir } };
+      databaseConfig = { kind: "sqlite", directory: sqliteDir };
     }
   } else {
     let connectionString: string | undefined = undefined;
@@ -167,13 +164,13 @@ export async function buildConfigAndIndexingFunctions({
         schema,
       };
     } else {
-      // Fall back to PGlite.
+      // Fall back to SQLite.
       logs.push({
         level: "info",
-        msg: `Using PGlite database at ${pglitePrintPath} (default)`,
+        msg: `Using SQLite database at ${sqlitePrintPath} (default)`,
       });
 
-      databaseConfig = { kind: "pglite", options: { dataDir: pgliteDir } };
+      databaseConfig = { kind: "sqlite", directory: sqliteDir };
     }
   }
 

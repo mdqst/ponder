@@ -1,41 +1,50 @@
-import { index, onchainTable, primaryKey } from "@ponder/core/db";
+import { createSchema } from "@ponder/core";
 
-export const account = onchainTable("account", (t) => ({
-  address: t.evmHex().primaryKey(),
-  balance: t.evmBigint().notNull(),
-  isOwner: t.boolean().notNull(),
-}));
+export default createSchema((p) => ({
+  Account: p.createTable({
+    id: p.hex(),
+    balance: p.bigint(),
+    isOwner: p.boolean(),
 
-export const allowance = onchainTable(
-  "allowance",
-  (t) => ({
-    owner: t.evmHex(),
-    spender: t.evmHex(),
-    amount: t.evmBigint().notNull(),
+    allowances: p.many("Allowance.ownerId"),
+    approvalOwnerEvents: p.many("ApprovalEvent.ownerId"),
+    approvalSpenderEvents: p.many("ApprovalEvent.spenderId"),
+    transferFromEvents: p.many("TransferEvent.fromId"),
+    transferToEvents: p.many("TransferEvent.toId"),
   }),
-  (table) => ({
-    pk: primaryKey({ columns: [table.owner, table.spender] }),
-  }),
-);
+  Allowance: p.createTable({
+    id: p.string(),
+    amount: p.bigint(),
 
-export const transferEvent = onchainTable(
-  "transfer_event",
-  (t) => ({
-    id: t.serial().primaryKey(),
-    amount: t.evmBigint().notNull(),
-    timestamp: t.integer().notNull(),
-    from: t.evmHex().notNull(),
-    to: t.evmHex().notNull(),
-  }),
-  (table) => ({
-    fromIdx: index("from_index").on(table.from),
-  }),
-);
+    ownerId: p.hex().references("Account.id"),
+    spenderId: p.hex().references("Account.id"),
 
-export const approvalEvent = onchainTable("approval_event", (t) => ({
-  id: t.serial().primaryKey(),
-  amount: t.evmBigint().notNull(),
-  timestamp: t.integer().notNull(),
-  owner: t.evmHex().notNull(),
-  spender: t.evmHex().notNull(),
+    owner: p.one("ownerId"),
+    spender: p.one("spenderId"),
+  }),
+  TransferEvent: p.createTable(
+    {
+      id: p.string(),
+      amount: p.bigint(),
+      timestamp: p.int(),
+
+      fromId: p.hex().references("Account.id"),
+      toId: p.hex().references("Account.id"),
+
+      from: p.one("fromId"),
+      to: p.one("toId"),
+    },
+    { fromIdIndex: p.index("fromId") },
+  ),
+  ApprovalEvent: p.createTable({
+    id: p.string(),
+    amount: p.bigint(),
+    timestamp: p.int(),
+
+    ownerId: p.hex().references("Account.id"),
+    spenderId: p.hex().references("Account.id"),
+
+    owner: p.one("ownerId"),
+    spender: p.one("spenderId"),
+  }),
 }));

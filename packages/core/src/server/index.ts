@@ -1,9 +1,12 @@
 import http from "node:http";
 import type { Common } from "@/common/common.js";
 import type { Database } from "@/database/index.js";
-import type { Schema } from "@/drizzle/index.js";
+import { createDrizzleDb, createDrizzleTables } from "@/drizzle/runtime.js";
+import { graphql } from "@/graphql/index.js";
 import { type PonderRoutes, applyHonoRoutes } from "@/hono/index.js";
 import { getMetadataStore } from "@/indexing-store/metadata.js";
+import { getReadonlyStore } from "@/indexing-store/readonly.js";
+import type { Schema } from "@/schema/common.js";
 import { startClock } from "@/utils/timer.js";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
@@ -33,7 +36,15 @@ export async function createServer({
 }): Promise<Server> {
   // Create hono app
 
+  const readonlyStore = getReadonlyStore({
+    dialect: database.dialect,
+    schema,
+    db: database.qb.readonly,
+    common,
+  });
+
   const metadataStore = getMetadataStore({
+    dialect: database.dialect,
     db: database.qb.readonly,
   });
 
@@ -81,11 +92,14 @@ export async function createServer({
     }
   });
 
-  // await migrate(db, { migrationsFolder: common.options.migrationsDir });
+  const db = createDrizzleDb(database);
+  const tables = createDrizzleTables(schema, database);
 
   // context required for graphql middleware and hono middleware
   const contextMiddleware = createMiddleware(async (c, next) => {
-    c.set("db", database.drizzle);
+    c.set("db", db);
+    c.set("tables", tables);
+    c.set("readonlyStore", readonlyStore);
     c.set("metadataStore", metadataStore);
     c.set("schema", schema);
     await next();
@@ -124,26 +138,26 @@ export async function createServer({
     })
     .use(contextMiddleware);
 
-  // if (userRoutes.length === 0 && userApp.routes.length === 0) {
-  //   // apply graphql middleware if no custom api exists
-  //   hono.use("/graphql", graphql());
-  //   hono.use("/", graphql());
-  // } else {
-  // apply user routes to hono instance, registering a custom error handler
-  applyHonoRoutes(hono, userRoutes, { db: database.drizzle }).onError(
-    (error, c) => onError(error, c, common),
-  );
+  if (userRoutes.length === 0 && userApp.routes.length === 0) {
+    // apply graphql middleware if no custom api exists
+    hono.use("/graphql", graphql());
+    hono.use("/", graphql());
+  } else {
+    // apply user routes to hono instance, registering a custom error handler
+    applyHonoRoutes(hono, userRoutes, { db, tables }).onError((error, c) =>
+      onError(error, c, common),
+    );
 
-  common.logger.debug({
-    service: "server",
-    msg: `Detected a custom server with routes: [${userRoutes
-      .map(({ pathOrHandlers: [maybePathOrHandler] }) => maybePathOrHandler)
-      .filter((maybePathOrHandler) => typeof maybePathOrHandler === "string")
-      .join(", ")}]`,
-  });
+    common.logger.debug({
+      service: "server",
+      msg: `Detected a custom server with routes: [${userRoutes
+        .map(({ pathOrHandlers: [maybePathOrHandler] }) => maybePathOrHandler)
+        .filter((maybePathOrHandler) => typeof maybePathOrHandler === "string")
+        .join(", ")}]`,
+    });
 
-  hono.route("/", userApp);
-  // }
+    hono.route("/", userApp);
+  }
 
   // Create nodejs server
 

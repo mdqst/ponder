@@ -6,11 +6,13 @@ import { BuildError } from "@/common/errors.js";
 import type { Config } from "@/config/config.js";
 import type { DatabaseConfig } from "@/config/database.js";
 import type { Network } from "@/config/networks.js";
-import type { Schema } from "@/drizzle/index.js";
+import { buildGraphQLSchema } from "@/graphql/buildGraphqlSchema.js";
 import type { PonderRoutes } from "@/hono/index.js";
+import type { Schema } from "@/schema/common.js";
 import type { Source } from "@/sync/source.js";
 import { serialize } from "@/utils/serialize.js";
 import { glob } from "glob";
+import type { GraphQLSchema } from "graphql";
 import type { Hono } from "hono";
 import { type ViteDevServer, createServer } from "vite";
 import { ViteNodeRunner } from "vite-node/client";
@@ -24,6 +26,7 @@ import {
   safeBuildConfigAndIndexingFunctions,
 } from "./configAndIndexingFunctions.js";
 import { vitePluginPonder } from "./plugin.js";
+import { safeBuildSchema } from "./schema.js";
 import { parseViteNodeError } from "./stacktrace.js";
 
 const BUILD_ID_VERSION = "1";
@@ -51,6 +54,7 @@ type BaseBuild = {
   networks: Network[];
   // Schema
   schema: Schema;
+  graphqlSchema: GraphQLSchema;
 };
 
 export type IndexingBuild = BaseBuild & {
@@ -265,7 +269,6 @@ export const start = async (
       const hasSchemaUpdate = invalidated.includes(
         common.options.schemaFile.replace(/\\/g, "/"),
       );
-
       const hasIndexingUpdate = invalidated.some(
         (file) =>
           buildService.indexingRegex.test(file) &&
@@ -481,11 +484,10 @@ const executeSchema = async (
     return executeResult;
   }
 
-  const schema = executeResult.exports;
+  const schema = executeResult.exports.default as Schema;
 
-  // TODO(kyle) hash the contents
   const contentHash = createHash("sha256")
-    .update(fs.readFileSync(buildService.common.options.schemaFile))
+    .update(serialize(schema))
     .digest("hex");
 
   return { status: "success", schema, contentHash };
@@ -603,6 +605,26 @@ const validateAndBuild = async (
     contentHash: string;
   },
 ): Promise<IndexingBuildResult> => {
+  // Validate and build the schema
+  const buildSchemaResult = safeBuildSchema({
+    schema: schema.schema,
+  });
+  if (buildSchemaResult.status === "error") {
+    common.logger.error({
+      service: "build",
+      msg: "Error while building schema:",
+      error: buildSchemaResult.error,
+    });
+
+    return buildSchemaResult;
+  }
+
+  for (const log of buildSchemaResult.logs) {
+    common.logger[log.level]({ service: "build", msg: log.msg });
+  }
+
+  const graphqlSchema = buildGraphQLSchema(buildSchemaResult.schema);
+
   // Validates and build the config
   const buildConfigAndIndexingFunctionsResult =
     await safeBuildConfigAndIndexingFunctions({
@@ -644,7 +666,8 @@ const validateAndBuild = async (
       databaseConfig: buildConfigAndIndexingFunctionsResult.databaseConfig,
       networks: buildConfigAndIndexingFunctionsResult.networks,
       sources: buildConfigAndIndexingFunctionsResult.sources,
-      schema: schema.schema,
+      schema: buildSchemaResult.schema,
+      graphqlSchema,
       indexingFunctions:
         buildConfigAndIndexingFunctionsResult.indexingFunctions,
     },

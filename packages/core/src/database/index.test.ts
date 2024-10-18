@@ -174,6 +174,7 @@ test("setup with the same build ID and namespace reverts to and returns the fina
   await database.setup({ buildId: "abc" });
 
   const realtimeIndexingStore = getRealtimeStore({
+    dialect: context.databaseConfig.kind,
     schema,
     db: database.qb.user,
     common: context.common,
@@ -230,6 +231,7 @@ test("setup with the same build ID and namespace reverts to and returns the fina
   });
 
   const readonlyIndexingStore = getReadonlyStore({
+    dialect: context.databaseConfig.kind,
     schema,
     db: databaseTwo.qb.user,
     common: context.common,
@@ -276,11 +278,17 @@ test("setup succeeds if the lock expires after waiting to expire", async (contex
     .updateTable("_ponder_meta")
     .where("key", "=", "app")
     .set({
-      value: {
-        // @ts-ignore
-        ...row!.value!,
-        // is_locked: true,
-      },
+      value:
+        database.dialect === "sqlite"
+          ? JSON.stringify({
+              ...JSON.parse(row!.value!),
+              is_locked: true,
+            })
+          : {
+              // @ts-ignore
+              ...row!.value!,
+              is_locked: true,
+            },
     })
     .execute();
 
@@ -331,7 +339,7 @@ test("setup throws if there is a table name collision", async (context) => {
   });
 
   await database.qb.internal.executeQuery(
-    sql`CREATE TABLE "public"."Pet" (id TEXT)`.compile(database.qb.internal),
+    sql`CREATE TABLE "Pet" (id TEXT)`.compile(database.qb.internal),
   );
 
   expect(await getUserTableNames(database)).toStrictEqual(["Pet"]);
@@ -369,8 +377,18 @@ test("heartbeat updates the heartbeat_at value", async (context) => {
     .executeTakeFirst();
 
   expect(
-    BigInt(rowAfterHeartbeat!.value!.heartbeat_at as number),
-  ).toBeGreaterThan(row!.value!.heartbeat_at as number);
+    BigInt(
+      database.dialect === "sqlite"
+        ? JSON.parse(rowAfterHeartbeat!.value!).heartbeat_at
+        : // @ts-ignore
+          rowAfterHeartbeat!.value!.heartbeat_at,
+    ),
+  ).toBeGreaterThan(
+    database.dialect === "sqlite"
+      ? JSON.parse(row!.value!).heartbeat_at
+      : // @ts-ignore
+        row!.value!.heartbeat_at,
+  );
 
   await database.kill();
 });
@@ -396,7 +414,12 @@ test("finalize updates lock table", async (context) => {
     .select("value")
     .executeTakeFirst();
 
-  expect(row!.value!.checkpoint).toStrictEqual(encodeCheckpoint(maxCheckpoint));
+  expect(
+    database.dialect === "sqlite"
+      ? JSON.parse(row!.value!).checkpoint
+      : // @ts-ignore
+        row!.value!.checkpoint,
+  ).toStrictEqual(encodeCheckpoint(maxCheckpoint));
 
   await database.kill();
 });
@@ -411,6 +434,7 @@ test("finalize delete reorg table rows", async (context) => {
   await database.setup({ buildId: "abc" });
 
   const realtimeIndexingStore = getRealtimeStore({
+    dialect: context.databaseConfig.kind,
     schema,
     db: database.qb.user,
     common: context.common,
@@ -498,8 +522,18 @@ test("kill releases the namespace lock", async (context) => {
     .select("value")
     .executeTakeFirst();
 
-  expect(row!.value!.is_locked).toBe(1);
-  expect(rowAfterKill!.value!.is_locked).toBe(0);
+  expect(
+    database.dialect === "sqlite"
+      ? JSON.parse(row!.value!).is_locked
+      : // @ts-ignore
+        row!.value!.is_locked,
+  ).toBe(1);
+  expect(
+    database.dialect === "sqlite"
+      ? JSON.parse(rowAfterKill!.value!).is_locked
+      : // @ts-ignore
+        rowAfterKill!.value!.is_locked,
+  ).toBe(0);
 
   await databaseTwo.kill();
 });
@@ -599,7 +633,9 @@ test("setup with the same build ID drops indexes", async (context) => {
 
   const indexes = await getUserIndexNames(databaseTwo, "Person");
 
-  expect(indexes).toStrictEqual(["Person_pkey"]);
+  expect(indexes).toStrictEqual([
+    database.dialect === "sqlite" ? "sqlite_autoindex_Person_1" : "Person_pkey",
+  ]);
 
   await databaseTwo.kill();
 });
@@ -607,7 +643,10 @@ test("setup with the same build ID drops indexes", async (context) => {
 test("revert() deletes versions newer than the safe timestamp", async (context) => {
   const { indexingStore, database, cleanup } = await setupDatabaseServices(
     context,
-    { schema, indexing: "realtime" },
+    {
+      schema,
+      indexing: "realtime",
+    },
   );
 
   await indexingStore.create({
@@ -683,7 +722,10 @@ test("revert() deletes versions newer than the safe timestamp", async (context) 
 test("revert() updates versions with intermediate logs", async (context) => {
   const { indexingStore, database, cleanup } = await setupDatabaseServices(
     context,
-    { schema, indexing: "realtime" },
+    {
+      schema,
+      indexing: "realtime",
+    },
   );
 
   await indexingStore.create({
@@ -719,12 +761,16 @@ test("revert() updates versions with intermediate logs", async (context) => {
 
 async function getUserTableNames(database: Database) {
   const { rows } = await database.qb.internal.executeQuery<{ name: string }>(
-    sql`
-      SELECT table_name as name
-      FROM information_schema.tables
-      WHERE table_schema = '${sql.raw(database.namespace)}'
-      AND table_type = 'BASE TABLE'
-    `.compile(database.qb.internal),
+    database.dialect === "sqlite"
+      ? sql`SELECT name FROM sqlite_master WHERE type='table'`.compile(
+          database.qb.internal,
+        )
+      : sql`
+    SELECT table_name as name
+    FROM information_schema.tables
+    WHERE table_schema = '${sql.raw(database.namespace)}'
+    AND table_type = 'BASE TABLE'
+  `.compile(database.qb.internal),
   );
   return rows.map(({ name }) => name);
 }
@@ -734,12 +780,16 @@ async function getUserIndexNames(database: Database, tableName: string) {
     name: string;
     tbl_name: string;
   }>(
-    sql`
-      SELECT indexname as name
-      FROM pg_indexes
-      WHERE schemaname = '${sql.raw(database.namespace)}'
-      AND tablename = '${sql.raw(tableName)}'
-    `.compile(database.qb.internal),
+    database.dialect === "sqlite"
+      ? sql`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='${sql.raw(tableName)}'`.compile(
+          database.qb.internal,
+        )
+      : sql`
+    SELECT indexname as name
+    FROM pg_indexes
+    WHERE schemaname = '${sql.raw(database.namespace)}'
+    AND tablename = '${sql.raw(tableName)}'
+  `.compile(database.qb.internal),
   );
   return rows.map((r) => r.name);
 }

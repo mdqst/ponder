@@ -69,15 +69,15 @@ export async function serve({ cliOptions }: { cliOptions: CliOptions }) {
 
   const { databaseConfig, schema } = api.build;
 
-  if (databaseConfig.kind === "pglite") {
+  if (databaseConfig.kind === "sqlite") {
     await shutdown({
-      reason: "The 'ponder serve' command does not support PGlite",
+      reason: "The 'ponder serve' command does not support SQLite",
       code: 1,
     });
     return cleanup;
   }
 
-  const database = await createDatabase({
+  const database = createDatabase({
     common,
     schema,
     databaseConfig,

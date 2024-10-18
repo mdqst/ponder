@@ -1,13 +1,12 @@
-import type { Drizzle, Schema } from "@/drizzle/index.js";
+import type { Schema } from "@/schema/common.js";
+import type { ApiContext } from "@/types/api.js";
 import type { Env, Context as HonoContext, Input } from "hono";
 
 export type Context<
   schema extends Schema = Schema,
   path extends string = string,
   input extends Input = {},
-> = {
-  db: Drizzle<schema>;
-} & {
+> = ApiContext<schema> & {
   /**
    * Hono request object.
    *
@@ -50,6 +49,4 @@ export type MiddlewareContext<
   schema extends Schema = Schema,
   path extends string = string,
   input extends Input = {},
-> = {
-  db: Drizzle<schema>;
-} & HonoContext<Env, path, input>;
+> = ApiContext<schema> & HonoContext<Env, path, input>;

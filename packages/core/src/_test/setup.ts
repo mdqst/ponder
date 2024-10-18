@@ -19,19 +19,13 @@ import type { IndexingStore, ReadonlyStore } from "@/indexing-store/store.js";
 import type { Schema } from "@/schema/common.js";
 import { type SyncStore, createSyncStore } from "@/sync-store/index.js";
 import type { BlockSource, ContractSource, LogFactory } from "@/sync/source.js";
-import { createPglite } from "@/utils/pglite.js";
 import type { RequestQueue } from "@/utils/requestQueue.js";
 import pg from "pg";
 import { rimrafSync } from "rimraf";
 import type { Address } from "viem";
-import { type TestContext, afterAll } from "vitest";
+import type { TestContext } from "vitest";
 import { deploy, simulate } from "./simulate.js";
-import {
-  getConfig,
-  getNetworkAndSources,
-  poolId,
-  testClient,
-} from "./utils.js";
+import { getConfig, getNetworkAndSources, testClient } from "./utils.js";
 
 declare module "vitest" {
   export interface TestContext {
@@ -72,51 +66,50 @@ export function setupCommon(context: TestContext) {
   };
 }
 
-const pgliteDataDirs = new Map<number, string>();
-afterAll(() => pgliteDataDirs.forEach((dataDir) => rimrafSync(dataDir)));
-
 /**
  * Sets up an isolated database on the test context.
  *
+ * If `process.env.DATABASE_URL` is set, creates a new database and drops
+ * it in the cleanup function. If it's not set, creates a temporary directory
+ * for SQLite and removes it in the cleanup function.
+ *
  * ```ts
  * // Add this to any test suite that uses the database.
- * beforeEach(setupIsolatedDatabase)
+ * beforeEach((context) => setupIsolatedDatabase(context))
  * ```
  */
 export async function setupIsolatedDatabase(context: TestContext) {
-  const connectionString = process.env.DATABASE_URL;
-  if (connectionString !== undefined) {
-    const databaseName = `vitest_${poolId}`;
+  if (process.env.DATABASE_URL) {
+    const databaseName = `vitest_${process.env.VITEST_POOL_ID ?? 1}`;
+    const databaseUrl = new URL(process.env.DATABASE_URL);
+    databaseUrl.pathname = `/${databaseName}`;
 
-    const client = new pg.Client({ connectionString });
+    const poolConfig = { max: 30, connectionString: databaseUrl.toString() };
+
+    const client = new pg.Client({
+      connectionString: process.env.DATABASE_URL,
+    });
     await client.connect();
     await client.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
     await client.query(`CREATE DATABASE "${databaseName}"`);
     await client.end();
 
-    const databaseUrl = new URL(connectionString);
-    databaseUrl.pathname = `/${databaseName}`;
-    const poolConfig = { max: 30, connectionString: databaseUrl.toString() };
+    context.databaseConfig = {
+      kind: "postgres",
+      poolConfig,
+      schema: "public",
+    };
 
-    context.databaseConfig = { kind: "postgres", poolConfig, schema: "public" };
+    return () => {};
   } else {
-    let dataDir = pgliteDataDirs.get(poolId);
-    if (dataDir === undefined) {
-      dataDir = path.join(os.tmpdir(), randomUUID());
-      mkdirSync(dataDir, { recursive: true });
-      pgliteDataDirs.set(poolId, dataDir);
-    }
+    const tempDir = path.join(os.tmpdir(), randomUUID());
+    mkdirSync(tempDir, { recursive: true });
 
-    const databaseName = `vitest_${poolId}`;
+    context.databaseConfig = { kind: "sqlite", directory: tempDir };
 
-    const parent = createPglite({ dataDir });
-    await parent.exec(`DROP DATABASE IF EXISTS "${databaseName}"`);
-    await parent.exec(`CREATE DATABASE "${databaseName}"`);
-    await parent.close();
-
-    const options = { dataDir, database: databaseName };
-
-    context.databaseConfig = { kind: "pglite", options };
+    return () => {
+      rimrafSync(tempDir);
+    };
   }
 }
 
@@ -142,7 +135,7 @@ export async function setupDatabaseServices(
   cleanup: () => Promise<void>;
 }> {
   const config = { ...defaultDatabaseServiceSetup, ...overrides };
-  const database = await createDatabase({
+  const database = createDatabase({
     common: context.common,
     databaseConfig: context.databaseConfig,
     schema: config.schema,
@@ -150,17 +143,16 @@ export async function setupDatabaseServices(
 
   await database.setup(config);
 
-  await database.migrateSync().catch((err) => {
-    console.log(err);
-    throw err;
-  });
+  await database.migrateSync();
 
   const syncStore = createSyncStore({
     common: context.common,
+    dialect: database.dialect,
     db: database.qb.sync,
   });
 
   const readonlyStore = getReadonlyStore({
+    dialect: database.dialect,
     schema: config.schema,
     db: database.qb.user,
     common: context.common,
@@ -169,6 +161,7 @@ export async function setupDatabaseServices(
   const indexingStore =
     config.indexing === "historical"
       ? getHistoricalStore({
+          dialect: database.dialect,
           schema: config.schema,
           readonlyStore,
           db: database.qb.user,
@@ -178,6 +171,7 @@ export async function setupDatabaseServices(
       : {
           ...readonlyStore,
           ...getRealtimeStore({
+            dialect: database.dialect,
             schema: config.schema,
             db: database.qb.user,
             common: context.common,

@@ -13,7 +13,7 @@ function getDatabase() {
     const connectionString = databaseUrl.toString();
     return { kind: "postgres", connectionString } as const;
   } else {
-    return { kind: "pglite" } as const;
+    return { kind: "sqlite" } as const;
   }
 }
 

@@ -15,7 +15,7 @@ export async function runServer({
 }) {
   const { databaseConfig, schema } = build;
 
-  const database = await createDatabase({
+  const database = createDatabase({
     common,
     schema,
     databaseConfig,

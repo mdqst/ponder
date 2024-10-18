@@ -1,36 +1,39 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { Common } from "@/common/common.js";
 import { NonRetryableError } from "@/common/errors.js";
 import type { DatabaseConfig } from "@/config/database.js";
-import { type Drizzle, type Schema, onchain } from "@/drizzle/index.js";
-import { generateTableSQL, getPrimaryKeyColumns } from "@/drizzle/sql.js";
+import type { Schema } from "@/schema/common.js";
+import {
+  getEnums,
+  getTables,
+  isEnumColumn,
+  isJSONColumn,
+  isListColumn,
+  isManyColumn,
+  isOneColumn,
+  isOptionalColumn,
+} from "@/schema/utils.js";
 import type { PonderSyncSchema } from "@/sync-store/encoding.js";
 import {
   moveLegacyTables,
   migrationProvider as postgresMigrationProvider,
-} from "@/sync-store/migrations.js";
-import type { Status } from "@/sync/index.js";
+} from "@/sync-store/postgres/migrations.js";
+import { migrationProvider as sqliteMigrationProvider } from "@/sync-store/sqlite/migrations.js";
+import type { UserTable } from "@/types/schema.js";
 import {
   decodeCheckpoint,
   encodeCheckpoint,
-  maxCheckpoint,
   zeroCheckpoint,
 } from "@/utils/checkpoint.js";
 import { formatEta } from "@/utils/format.js";
-import { createPool } from "@/utils/pg.js";
-import { createPglite } from "@/utils/pglite.js";
-import { wait } from "@/utils/wait.js";
-import type { PGlite } from "@electric-sql/pglite";
-import { getTableColumns, getTableName, is } from "drizzle-orm";
-import { drizzle as drizzleNodePg } from "drizzle-orm/node-postgres";
+import { createPool, createReadonlyPool } from "@/utils/pg.js";
 import {
-  PgTable,
-  getTableConfig,
-  integer,
-  pgTable,
-  serial,
-  varchar,
-} from "drizzle-orm/pg-core";
-import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
+  type SqliteDatabase,
+  createReadonlySqliteDatabase,
+  createSqliteDatabase,
+} from "@/utils/sqlite.js";
+import { wait } from "@/utils/wait.js";
 import {
   Migrator,
   PostgresDialect,
@@ -38,19 +41,18 @@ import {
   WithSchemaPlugin,
   sql,
 } from "kysely";
-import { KyselyPGlite } from "kysely-pglite";
+import { SqliteDialect } from "kysely";
 import type { Pool } from "pg";
 import prometheus from "prom-client";
 import { HeadlessKysely } from "./kysely.js";
 
 export type Database<
-  dialect extends "pglite" | "postgres" = "pglite" | "postgres",
+  dialect extends "sqlite" | "postgres" = "sqlite" | "postgres",
 > = {
   dialect: dialect;
   namespace: string;
   driver: Driver<dialect>;
   qb: QueryBuilder;
-  drizzle: Drizzle<Schema>;
   migrateSync(): Promise<void>;
   /**
    * Prepare the database environment for a Ponder app.
@@ -68,11 +70,9 @@ export type Database<
    * - Else, start
    */
   setup(args: { buildId: string }): Promise<{ checkpoint: string }>;
-  createTriggers(): Promise<void>;
   revert(args: { checkpoint: string }): Promise<void>;
   finalize(args: { checkpoint: string }): Promise<void>;
-  // createIndexes(args: { schema: Schema }): Promise<void>;
-  complete(args: { checkpoint: string }): Promise<void>;
+  createIndexes(args: { schema: Schema }): Promise<void>;
   kill(): Promise<void>;
 };
 
@@ -88,30 +88,31 @@ type PonderApp = {
 type PonderInternalSchema = {
   _ponder_meta: {
     key: "status" | "app";
-    value: PonderApp | Status | null;
+    value: string | null;
   };
 } & {
   [_: `_ponder_reorg__${string}`]: {
+    id: unknown;
     operation_id: number;
     checkpoint: string;
     operation: 0 | 1 | 2;
   };
+} & {
+  [tableName: string]: UserTable;
 };
 
-type PGliteDriver = {
-  instance: PGlite;
-};
-
-type PostgresDriver = {
-  internal: Pool;
-  user: Pool;
-  readonly: Pool;
-  sync: Pool;
-};
-
-type Driver<dialect extends "pglite" | "postgres"> = dialect extends "pglite"
-  ? PGliteDriver
-  : PostgresDriver;
+type Driver<dialect extends "sqlite" | "postgres"> = dialect extends "sqlite"
+  ? {
+      user: SqliteDatabase;
+      readonly: SqliteDatabase;
+      sync: SqliteDatabase;
+    }
+  : {
+      internal: Pool;
+      user: Pool;
+      readonly: Pool;
+      sync: Pool;
+    };
 
 type QueryBuilder = {
   /** For updating metadata and handling reorgs */
@@ -124,11 +125,29 @@ type QueryBuilder = {
   sync: HeadlessKysely<PonderSyncSchema>;
 };
 
-export const createDatabase = async (args: {
+const scalarToSqliteType = {
+  boolean: "integer",
+  int: "integer",
+  float: "real",
+  string: "text",
+  bigint: "varchar(79)",
+  hex: "blob",
+} as const;
+
+const scalarToPostgresType = {
+  boolean: "integer",
+  int: "integer",
+  float: "float8",
+  string: "text",
+  bigint: "numeric(78, 0)",
+  hex: "bytea",
+} as const;
+
+export const createDatabase = (args: {
   common: Common;
   schema: Schema;
   databaseConfig: DatabaseConfig;
-}): Promise<Database> => {
+}): Database => {
   let heartbeatInterval: NodeJS.Timeout | undefined;
   let namespace: string;
 
@@ -136,29 +155,32 @@ export const createDatabase = async (args: {
   // Create drivers and orms
   ////////
 
+  let dialect: Database["dialect"];
   let driver: Database["driver"];
   let qb: Database["qb"];
 
-  const dialect = args.databaseConfig.kind;
-
-  if (args.databaseConfig.kind === "pglite") {
+  if (args.databaseConfig.kind === "sqlite") {
+    dialect = "sqlite";
     namespace = "public";
 
-    driver = {
-      instance: createPglite(args.databaseConfig.options),
-    };
+    const userFile = path.join(args.databaseConfig.directory, "public.db");
+    const syncFile = path.join(args.databaseConfig.directory, "ponder_sync.db");
 
-    const kyselyDialect = new KyselyPGlite(driver.instance).dialect;
+    driver = {
+      user: createSqliteDatabase(userFile),
+      readonly: createReadonlySqliteDatabase(userFile),
+      sync: createSqliteDatabase(syncFile),
+    };
 
     qb = {
       internal: new HeadlessKysely({
         name: "internal",
         common: args.common,
-        dialect: kyselyDialect,
+        dialect: new SqliteDialect({ database: driver.user }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_postgres_query_total.inc({
-              pool: "internal",
+            args.common.metrics.ponder_sqlite_query_total.inc({
+              database: "internal",
             });
           }
         },
@@ -166,11 +188,11 @@ export const createDatabase = async (args: {
       user: new HeadlessKysely({
         name: "user",
         common: args.common,
-        dialect: kyselyDialect,
+        dialect: new SqliteDialect({ database: driver.user }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_postgres_query_total.inc({
-              pool: "user",
+            args.common.metrics.ponder_sqlite_query_total.inc({
+              database: "user",
             });
           }
         },
@@ -178,11 +200,11 @@ export const createDatabase = async (args: {
       readonly: new HeadlessKysely({
         name: "readonly",
         common: args.common,
-        dialect: kyselyDialect,
+        dialect: new SqliteDialect({ database: driver.readonly }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_postgres_query_total.inc({
-              pool: "readonly",
+            args.common.metrics.ponder_sqlite_query_total.inc({
+              database: "readonly",
             });
           }
         },
@@ -190,18 +212,18 @@ export const createDatabase = async (args: {
       sync: new HeadlessKysely<PonderSyncSchema>({
         name: "sync",
         common: args.common,
-        dialect: kyselyDialect,
+        dialect: new SqliteDialect({ database: driver.sync }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_postgres_query_total.inc({
-              pool: "sync",
+            args.common.metrics.ponder_sqlite_query_total.inc({
+              database: "sync",
             });
           }
         },
-        plugins: [new WithSchemaPlugin("ponder_sync")],
       }),
     };
   } else {
+    dialect = "postgres";
     namespace = args.databaseConfig.schema;
 
     const internalMax = 2;
@@ -225,7 +247,7 @@ export const createDatabase = async (args: {
         application_name: `${namespace}_user`,
         max: userMax,
       }),
-      readonly: createPool({
+      readonly: createReadonlyPool({
         ...args.databaseConfig.poolConfig,
         application_name: `${namespace}_readonly`,
         max: readonlyMax,
@@ -293,92 +315,120 @@ export const createDatabase = async (args: {
     };
   }
 
-  /**
-   * Reset the prototype so `table instanceof PgTable` evaluates to true.
-   */
-  for (const table of Object.values(args.schema)) {
-    // @ts-ignore
-    if (onchain in table) {
-      Object.setPrototypeOf(table, PgTable.prototype);
-    }
-  }
-
-  const drizzle =
-    dialect === "pglite"
-      ? drizzlePglite((driver as PGliteDriver).instance, args.schema)
-      : drizzleNodePg((driver as PostgresDriver).user, args.schema);
-
-  // if (fs.existsSync(args.common.options.migrationsDir)) {
-  //   await migrate(drizzle, {
-  //     migrationsFolder: args.common.options.migrationsDir,
-  //   });
-  // }
-
   // Register metrics
-  const d = driver as PostgresDriver;
-  args.common.metrics.registry.removeSingleMetric(
-    "ponder_postgres_pool_connections",
-  );
-  args.common.metrics.ponder_postgres_pool_connections = new prometheus.Gauge({
-    name: "ponder_postgres_pool_connections",
-    help: "Number of connections in the pool",
-    labelNames: ["pool", "kind"] as const,
-    registers: [args.common.metrics.registry],
-    collect() {
-      this.set({ pool: "internal", kind: "idle" }, d.internal.idleCount);
-      this.set({ pool: "internal", kind: "total" }, d.internal.totalCount);
-      this.set({ pool: "sync", kind: "idle" }, d.sync.idleCount);
-      this.set({ pool: "sync", kind: "total" }, d.sync.totalCount);
-      this.set({ pool: "user", kind: "idle" }, d.user.idleCount);
-      this.set({ pool: "user", kind: "total" }, d.user.totalCount);
-      this.set({ pool: "readonly", kind: "idle" }, d.readonly.idleCount);
-      this.set({ pool: "readonly", kind: "total" }, d.readonly.totalCount);
-    },
-  });
+  if (dialect === "sqlite") {
+    args.common.metrics.registry.removeSingleMetric(
+      "ponder_sqlite_query_total",
+    );
+    args.common.metrics.ponder_sqlite_query_total = new prometheus.Counter({
+      name: "ponder_sqlite_query_total",
+      help: "Number of queries submitted to the database",
+      labelNames: ["database"] as const,
+      registers: [args.common.metrics.registry],
+    });
+  } else {
+    args.common.metrics.registry.removeSingleMetric(
+      "ponder_postgres_query_total",
+    );
+    args.common.metrics.ponder_postgres_query_total = new prometheus.Counter({
+      name: "ponder_postgres_query_total",
+      help: "Total number of queries submitted to the database",
+      labelNames: ["pool"] as const,
+      registers: [args.common.metrics.registry],
+    });
 
-  args.common.metrics.registry.removeSingleMetric(
-    "ponder_postgres_query_queue_size",
-  );
-  args.common.metrics.ponder_postgres_query_queue_size = new prometheus.Gauge({
-    name: "ponder_postgres_query_queue_size",
-    help: "Number of query requests waiting for an available connection",
-    labelNames: ["pool"] as const,
-    registers: [args.common.metrics.registry],
-    collect() {
-      this.set({ pool: "internal" }, d.internal.waitingCount);
-      this.set({ pool: "sync" }, d.sync.waitingCount);
-      this.set({ pool: "user" }, d.user.waitingCount);
-      this.set({ pool: "readonly" }, d.readonly.waitingCount);
-    },
-  });
+    args.common.metrics.registry.removeSingleMetric(
+      "ponder_postgres_pool_connections",
+    );
+    args.common.metrics.ponder_postgres_pool_connections = new prometheus.Gauge(
+      {
+        name: "ponder_postgres_pool_connections",
+        help: "Number of connections in the pool",
+        labelNames: ["pool", "kind"] as const,
+        registers: [args.common.metrics.registry],
+        collect() {
+          this.set(
+            { pool: "internal", kind: "idle" },
+            // @ts-ignore
+            driver.internal.idleCount,
+          );
+          this.set(
+            { pool: "internal", kind: "total" },
+            // @ts-ignore
+            driver.internal.totalCount,
+          );
 
+          this.set(
+            { pool: "sync", kind: "idle" },
+            (driver.sync as Pool).idleCount,
+          );
+          this.set(
+            { pool: "sync", kind: "total" },
+            (driver.sync as Pool).totalCount,
+          );
+
+          this.set(
+            { pool: "user", kind: "idle" },
+            (driver.user as Pool).idleCount,
+          );
+          this.set(
+            { pool: "user", kind: "total" },
+            (driver.user as Pool).totalCount,
+          );
+
+          this.set(
+            { pool: "readonly", kind: "idle" },
+            (driver.readonly as Pool).idleCount,
+          );
+          this.set(
+            { pool: "readonly", kind: "total" },
+            (driver.readonly as Pool).totalCount,
+          );
+        },
+      },
+    );
+
+    args.common.metrics.registry.removeSingleMetric(
+      "ponder_postgres_query_queue_size",
+    );
+    args.common.metrics.ponder_postgres_query_queue_size = new prometheus.Gauge(
+      {
+        name: "ponder_postgres_query_queue_size",
+        help: "Number of query requests waiting for an available connection",
+        labelNames: ["pool"] as const,
+        registers: [args.common.metrics.registry],
+        collect() {
+          // @ts-ignore
+          this.set({ pool: "internal" }, driver.internal.waitingCount);
+          this.set({ pool: "sync" }, (driver.sync as Pool).waitingCount);
+          this.set({ pool: "user" }, (driver.user as Pool).waitingCount);
+          this.set(
+            { pool: "readonly" },
+            (driver.readonly as Pool).waitingCount,
+          );
+        },
+      },
+    );
+  }
   ////////
   // Helpers
   ////////
 
-  /**
-   * Undo operations in user tables by using the `_ponder_reorg` metadata.
-   *
-   * Note: `_ponder_reorg` tables may contain operations that have not been applied to the
-   *       underlying tables, but only be 1 operation at most.
-   */
+  const encodeApp = (app: PonderApp) => {
+    return dialect === "sqlite" ? JSON.stringify(app) : (app as any);
+  };
+
   const revert = async ({
-    sqlTableName,
-    jsTableName,
+    tableName,
     checkpoint,
     tx,
   }: {
-    sqlTableName: string;
-    jsTableName: string;
+    tableName: string;
     checkpoint: string;
     tx: Transaction<PonderInternalSchema>;
   }) => {
-    const primaryKeyColumns = getPrimaryKeyColumns(
-      args.schema[jsTableName] as PgTable,
-    );
-
     const rows = await tx
-      .deleteFrom(`_ponder_reorg__${sqlTableName}`)
+      .deleteFrom(`_ponder_reorg__${tableName}`)
       .returningAll()
       .where("checkpoint", ">", checkpoint)
       .execute();
@@ -390,15 +440,8 @@ export const createDatabase = async (args: {
       if (log.operation === 0) {
         // Create
         await tx
-          // @ts-ignore
           .deleteFrom(tableName)
-          .$call((qb) => {
-            for (const name of primaryKeyColumns) {
-              // @ts-ignore
-              qb = qb.where(name, "=", log[name]);
-            }
-            return qb;
-          })
+          .where("id", "=", log.id as any)
           .execute();
       } else if (log.operation === 1) {
         // Update
@@ -410,16 +453,9 @@ export const createDatabase = async (args: {
         // @ts-ignore
         log.operation = undefined;
         await tx
-          // @ts-ignore
           .updateTable(tableName)
           .set(log as any)
-          .$call((qb) => {
-            for (const name of primaryKeyColumns) {
-              // @ts-ignore
-              qb = qb.where(name, "=", log[name]);
-            }
-            return qb;
-          })
+          .where("id", "=", log.id as any)
           .execute();
       } else {
         // Delete
@@ -431,35 +467,16 @@ export const createDatabase = async (args: {
         // @ts-ignore
         log.operation = undefined;
         await tx
-          // @ts-ignore
           .insertInto(tableName)
           .values(log as any)
-          // @ts-ignore
-          .onConflict((oc) => oc.columns(primaryKeyColumns).doNothing())
           .execute();
       }
     }
 
     args.common.logger.info({
       service: "database",
-      msg: `Reverted ${rows.length} unfinalized operations from '${sqlTableName}' table`,
+      msg: `Reverted ${rows.length} unfinalized operations from '${tableName}' table`,
     });
-  };
-
-  const getJsTableNames = () => {
-    const tableNames = Object.entries(args.schema)
-      .filter(([, table]) => is(table, PgTable))
-      .map(([tableName]) => tableName);
-
-    return tableNames;
-  };
-
-  const getSQLTableNames = () => {
-    const tableNames = Object.values(args.schema)
-      .filter((table): table is PgTable => is(table, PgTable))
-      .map((table) => getTableConfig(table).name);
-
-    return tableNames;
   };
 
   return {
@@ -467,23 +484,32 @@ export const createDatabase = async (args: {
     namespace,
     driver,
     qb,
-    drizzle,
     async migrateSync() {
       await qb.sync.wrap({ method: "migrateSyncStore" }, async () => {
         // TODO: Probably remove this at 1.0 to speed up startup time.
         // TODO(kevin) is the `WithSchemaPlugin` going to break this?
-        await moveLegacyTables({
-          common: args.common,
-          // @ts-expect-error
-          db: qb.internal,
-          newSchemaName: "ponder_sync",
-        });
+        if (dialect === "postgres") {
+          await moveLegacyTables({
+            common: args.common,
+            db: qb.internal,
+            newSchemaName: "ponder_sync",
+          });
+        }
 
-        const migrator = new Migrator({
-          db: qb.sync as any,
-          provider: postgresMigrationProvider,
-          migrationTableSchema: "ponder_sync",
-        });
+        let migrator: Migrator;
+
+        if (dialect === "sqlite") {
+          migrator = new Migrator({
+            db: qb.sync as any,
+            provider: sqliteMigrationProvider,
+          });
+        } else {
+          migrator = new Migrator({
+            db: qb.sync as any,
+            provider: postgresMigrationProvider,
+            migrationTableSchema: "ponder_sync",
+          });
+        }
 
         const { error } = await migrator.migrateToLatest();
         if (error) throw error;
@@ -498,66 +524,136 @@ export const createDatabase = async (args: {
 
       // v0.6 migration
 
-      const hasPonderSchema = await qb.internal
-        // @ts-ignore
-        .selectFrom("information_schema.schemata")
-        // @ts-ignore
-        .select("schema_name")
-        // @ts-ignore
-        .where("schema_name", "=", "ponder")
-        .executeTakeFirst()
-        .then((schema) => schema?.schema_name === "ponder");
+      if (args.databaseConfig.kind === "sqlite") {
+        const ponderFile = path.join(
+          args.databaseConfig.directory,
+          "ponder.db",
+        );
+        if (fs.existsSync(ponderFile)) {
+          const _driver = createSqliteDatabase(ponderFile);
+          const _orm = new HeadlessKysely<any>({
+            name: "user",
+            common: args.common,
+            dialect: new SqliteDialect({ database: _driver }),
+          });
+          await qb.internal.wrap({ method: "setup" }, async () => {
+            const namespaceCount = await _orm
+              .selectFrom("namespace_lock")
+              .select(sql`count(*)`.as("count"))
+              .executeTakeFirst();
 
-      if (hasPonderSchema) {
-        await qb.internal.wrap({ method: "setup" }, async () => {
-          const namespaceCount = await qb.internal
-            .withSchema("ponder")
-            // @ts-ignore
-            .selectFrom("namespace_lock")
-            .select(sql`count(*)`.as("count"))
-            .executeTakeFirst();
-
-          const tableNames = await qb.internal
-            .withSchema("ponder")
-            // @ts-ignore
-            .selectFrom("namespace_lock")
-            // @ts-ignore
-            .select("schema")
-            // @ts-ignore
-            .where("namespace", "=", namespace)
-            .executeTakeFirst()
-            .then((schema: any | undefined) =>
-              schema === undefined
-                ? undefined
-                : Object.keys(schema.schema.tables),
-            );
-          if (tableNames) {
-            for (const tableName of tableNames) {
-              await qb.internal.schema
-                .dropTable(tableName)
-                .ifExists()
-                .cascade()
-                .execute();
-            }
-
-            await qb.internal
-              .withSchema("ponder")
-              // @ts-ignore
-              .deleteFrom("namespace_lock")
-              // @ts-ignore
+            const tableNames = await _orm
+              .selectFrom("namespace_lock")
+              .select("schema")
               .where("namespace", "=", namespace)
-              .execute();
+              .executeTakeFirst()
+              .then((schema) =>
+                schema === undefined
+                  ? undefined
+                  : Object.keys(JSON.parse(schema.schema).tables),
+              );
+            if (tableNames) {
+              for (const tableName of tableNames) {
+                await qb.internal.schema
+                  .dropTable(tableName)
+                  .ifExists()
+                  .execute();
+              }
 
-            if (namespaceCount!.count === 1) {
-              await qb.internal.schema.dropSchema("ponder").cascade().execute();
+              await _orm
+                .deleteFrom("namespace_lock")
+                .where("namespace", "=", namespace)
+                .execute();
 
-              args.common.logger.debug({
-                service: "database",
-                msg: `Removed 'ponder' schema`,
-              });
+              await _orm.destroy();
+              _driver.close();
+
+              if (namespaceCount!.count === 1) {
+                fs.rmSync(
+                  // @ts-ignore
+                  path.join(args.databaseConfig.directory, "ponder.db"),
+                  {
+                    force: true,
+                  },
+                );
+                fs.rmSync(
+                  // @ts-ignore
+                  path.join(args.databaseConfig.directory, "ponder.db-shm"),
+                  {
+                    force: true,
+                  },
+                );
+                fs.rmSync(
+                  // @ts-ignore
+                  path.join(args.databaseConfig.directory, "ponder.db-wal"),
+                  {
+                    force: true,
+                  },
+                );
+                args.common.logger.debug({
+                  service: "database",
+                  msg: `Removed '.ponder/sqlite/ponder.db' file`,
+                });
+              }
             }
-          }
-        });
+          });
+        }
+      } else {
+        const hasPonderSchema = await qb.internal
+          .selectFrom("information_schema.schemata")
+          .select("schema_name")
+          .where("schema_name", "=", "ponder")
+          .executeTakeFirst()
+          .then((schema) => schema?.schema_name === "ponder");
+
+        if (hasPonderSchema) {
+          await qb.internal.wrap({ method: "setup" }, async () => {
+            const namespaceCount = await qb.internal
+              .withSchema("ponder")
+              .selectFrom("namespace_lock")
+              .select(sql`count(*)`.as("count"))
+              .executeTakeFirst();
+
+            const tableNames = await qb.internal
+              .withSchema("ponder")
+              .selectFrom("namespace_lock")
+              .select("schema")
+              .where("namespace", "=", namespace)
+              .executeTakeFirst()
+              .then((schema: any | undefined) =>
+                schema === undefined
+                  ? undefined
+                  : Object.keys(schema.schema.tables),
+              );
+            if (tableNames) {
+              for (const tableName of tableNames) {
+                await qb.internal.schema
+                  .dropTable(tableName)
+                  .ifExists()
+                  .cascade()
+                  .execute();
+              }
+
+              await qb.internal
+                .withSchema("ponder")
+                .deleteFrom("namespace_lock")
+                .where("namespace", "=", namespace)
+                .execute();
+
+              if (namespaceCount!.count === 1) {
+                await qb.internal.schema
+                  .dropSchema("ponder")
+                  .cascade()
+                  .execute();
+
+                args.common.logger.debug({
+                  service: "database",
+                  msg: `Removed 'ponder' schema`,
+                });
+              }
+            }
+          });
+        }
       }
 
       await qb.internal.wrap({ method: "setup" }, async () => {
@@ -585,46 +681,147 @@ export const createDatabase = async (args: {
             ////////
 
             const createUserTables = async () => {
-              for (const table of Object.values(args.schema)) {
-                if (is(table, PgTable)) {
-                  await sql
-                    .raw(generateTableSQL({ table, namespace }))
-                    .execute(tx);
+              for (const [tableName, table] of Object.entries(
+                getTables(args.schema),
+              )) {
+                await tx.schema
+                  .createTable(tableName)
+                  .$call((builder) => {
+                    for (const [columnName, column] of Object.entries(
+                      table.table,
+                    )) {
+                      if (isOneColumn(column)) continue;
+                      if (isManyColumn(column)) continue;
+                      if (isEnumColumn(column)) {
+                        // Handle enum types
+                        builder = builder.addColumn(
+                          columnName,
+                          "text",
+                          (col) => {
+                            if (isOptionalColumn(column) === false)
+                              col = col.notNull();
+                            if (isListColumn(column) === false) {
+                              col = col.check(
+                                sql`${sql.ref(columnName)} in (${sql.join(
+                                  getEnums(args.schema)[column[" enum"]]!.map(
+                                    (v) => sql.lit(v),
+                                  ),
+                                )})`,
+                              );
+                            }
+                            return col;
+                          },
+                        );
+                      } else if (isListColumn(column)) {
+                        // Handle scalar list columns
+                        builder = builder.addColumn(
+                          columnName,
+                          "text",
+                          (col) => {
+                            if (isOptionalColumn(column) === false)
+                              col = col.notNull();
+                            return col;
+                          },
+                        );
+                      } else if (isJSONColumn(column)) {
+                        // Handle json columns
+                        builder = builder.addColumn(
+                          columnName,
+                          "jsonb",
+                          (col) => {
+                            if (isOptionalColumn(column) === false)
+                              col = col.notNull();
+                            return col;
+                          },
+                        );
+                      } else {
+                        // Non-list base columns
+                        builder = builder.addColumn(
+                          columnName,
+                          (dialect === "sqlite"
+                            ? scalarToSqliteType
+                            : scalarToPostgresType)[column[" scalar"]],
+                          (col) => {
+                            if (isOptionalColumn(column) === false)
+                              col = col.notNull();
+                            if (columnName === "id") col = col.primaryKey();
+                            return col;
+                          },
+                        );
+                      }
+                    }
 
-                  args.common.logger.info({
-                    service: "database",
-                    msg: `Created table '${namespace}'.'${getTableName(table)}'`,
+                    return builder;
+                  })
+                  .execute()
+                  .catch((_error) => {
+                    const error = _error as Error;
+                    if (!error.message.includes("already exists")) throw error;
+                    throw new NonRetryableError(
+                      `Unable to create table '${namespace}'.'${tableName}' because a table with that name already exists. Is there another application using the '${namespace}' database schema?`,
+                    );
                   });
-                }
+
+                args.common.logger.info({
+                  service: "database",
+                  msg: `Created table '${namespace}'.'${tableName}'`,
+                });
               }
             };
 
             const createReorgTables = async () => {
-              for (const table of Object.values(args.schema)) {
-                if (is(table, PgTable)) {
-                  const extraColumns = Object.values(
-                    pgTable("", {
-                      operation_id: serial("operation_id")
-                        .notNull()
-                        .primaryKey(),
-                      operation: integer("operation").notNull(),
-                      checkpoint: varchar("checkpoint", {
-                        length: 75,
-                      }).notNull(),
-                    }),
-                  );
+              for (const [tableName, table] of Object.entries(
+                getTables(args.schema),
+              )) {
+                await tx.schema
+                  .createTable(`_ponder_reorg__${tableName}`)
+                  .$call((builder) => {
+                    for (const [columnName, column] of Object.entries(
+                      table.table,
+                    )) {
+                      if (isOneColumn(column)) continue;
+                      if (isManyColumn(column)) continue;
+                      if (isEnumColumn(column)) {
+                        // Handle enum types
+                        // Omit the CHECK constraint because its included in the user table
+                        builder = builder.addColumn(columnName, "text");
+                      } else if (isListColumn(column)) {
+                        // Handle scalar list columns
+                        builder = builder.addColumn(columnName, "text");
+                      } else if (isJSONColumn(column)) {
+                        // Handle json columns
+                        builder = builder.addColumn(columnName, "jsonb");
+                      } else {
+                        // Non-list base columns
+                        builder = builder.addColumn(
+                          columnName,
+                          (dialect === "sqlite"
+                            ? scalarToSqliteType
+                            : scalarToPostgresType)[column[" scalar"]],
+                          (col) => {
+                            if (columnName === "id") col = col.notNull();
+                            return col;
+                          },
+                        );
+                      }
+                    }
 
-                  await sql
-                    .raw(
-                      generateTableSQL({
-                        table,
-                        namespace,
-                        extraColumns,
-                        namePrefix: "_ponder_reorg__",
-                      }),
-                    )
-                    .execute(tx);
-                }
+                    builder = builder
+                      .addColumn(
+                        "operation_id",
+                        dialect === "sqlite" ? "integer" : "serial",
+                        (col) => col.notNull().primaryKey(),
+                      )
+                      .addColumn("checkpoint", "varchar(75)", (col) =>
+                        col.notNull(),
+                      )
+                      .addColumn("operation", "integer", (col) =>
+                        col.notNull(),
+                      );
+
+                    return builder;
+                  })
+                  .execute();
               }
             };
 
@@ -634,9 +831,12 @@ export const createDatabase = async (args: {
               .select("value")
               .executeTakeFirst();
 
-            const previousApp = (row?.value ?? undefined) as
-              | PonderApp
-              | undefined;
+            const previousApp: PonderApp | undefined =
+              row === undefined
+                ? undefined
+                : dialect === "sqlite"
+                  ? JSON.parse(row.value!)
+                  : row.value;
 
             const newApp = {
               is_locked: 1,
@@ -644,7 +844,7 @@ export const createDatabase = async (args: {
               heartbeat_at: Date.now(),
               build_id: buildId,
               checkpoint: encodeCheckpoint(zeroCheckpoint),
-              table_names: getSQLTableNames(),
+              table_names: Object.keys(getTables(args.schema)),
             } satisfies PonderApp;
 
             /**
@@ -660,7 +860,7 @@ export const createDatabase = async (args: {
                 .execute();
               await tx
                 .insertInto("_ponder_meta")
-                .values({ key: "app", value: newApp })
+                .values({ key: "app", value: encodeApp(newApp) })
                 .execute();
               args.common.logger.debug({
                 service: "database",
@@ -708,12 +908,12 @@ export const createDatabase = async (args: {
               await tx
                 .updateTable("_ponder_meta")
                 .set({
-                  value: {
+                  value: encodeApp({
                     ...previousApp,
                     is_locked: 1,
                     is_dev: 0,
                     heartbeat_at: Date.now(),
-                  },
+                  }),
                 })
                 .where("key", "=", "app")
                 .execute();
@@ -728,35 +928,22 @@ export const createDatabase = async (args: {
               });
 
               // Remove indexes
-              // for (const [tableName, table] of Object.entries(
-              //   getTables(args.schema),
-              // )) {
-              //   if (table.constraints === undefined) continue;
+              for (const [tableName, table] of Object.entries(
+                getTables(args.schema),
+              )) {
+                if (table.constraints === undefined) continue;
 
-              //   for (const name of Object.keys(table.constraints)) {
-              //     await tx.schema
-              //       .dropIndex(`${tableName}_${name}`)
-              //       .ifExists()
-              //       .execute();
+                for (const name of Object.keys(table.constraints)) {
+                  await tx.schema
+                    .dropIndex(`${tableName}_${name}`)
+                    .ifExists()
+                    .execute();
 
-              //     args.common.logger.info({
-              //       service: "database",
-              //       msg: `Dropped index '${tableName}_${name}' in schema '${namespace}'`,
-              //     });
-              //   }
-              // }
-
-              // Remove triggers
-
-              const sqlTableNames = getSQLTableNames();
-              const jsTableNames = getJsTableNames();
-
-              for (const tableName of sqlTableNames) {
-                await sql
-                  .ref(
-                    `DROP TRIGGER IF EXISTS "${tableName}_reorg" ON "${namespace}"."${tableName}"`,
-                  )
-                  .execute(tx);
+                  args.common.logger.info({
+                    service: "database",
+                    msg: `Dropped index '${tableName}_${name}' in schema '${namespace}'`,
+                  });
+                }
               }
 
               // Revert unfinalized data
@@ -769,10 +956,9 @@ export const createDatabase = async (args: {
                 msg: `Reverting operations after finalized checkpoint (timestamp=${blockTimestamp} chainId=${chainId} block=${blockNumber})`,
               });
 
-              for (let i = 0; i < sqlTableNames.length; i++) {
+              for (const tableName of Object.keys(getTables(args.schema))) {
                 await revert({
-                  sqlTableName: sqlTableNames[i]!,
-                  jsTableName: jsTableNames[i]!,
+                  tableName,
                   checkpoint: previousApp.checkpoint,
                   tx,
                 });
@@ -792,7 +978,7 @@ export const createDatabase = async (args: {
 
             await tx
               .updateTable("_ponder_meta")
-              .set({ value: newApp })
+              .set({ value: encodeApp(newApp) })
               .where("key", "=", "app")
               .execute();
 
@@ -809,11 +995,7 @@ export const createDatabase = async (args: {
                 .ifExists()
                 .execute();
 
-              await tx.schema
-                .dropTable(tableName)
-                .ifExists()
-                .cascade()
-                .execute();
+              await tx.schema.dropTable(tableName).ifExists().execute();
 
               args.common.logger.debug({
                 service: "database",
@@ -861,7 +1043,10 @@ export const createDatabase = async (args: {
             .updateTable("_ponder_meta")
             .where("key", "=", "app")
             .set({
-              value: sql`jsonb_set(value, '{heartbeat_at}', ${heartbeat})`,
+              value:
+                dialect === "sqlite"
+                  ? sql`json_set(value, '$.heartbeat_at', ${heartbeat})`
+                  : sql`jsonb_set(value, '{heartbeat_at}', ${heartbeat})`,
             })
             .execute();
 
@@ -871,6 +1056,7 @@ export const createDatabase = async (args: {
           });
         } catch (err) {
           const error = err as Error;
+          console.log(error);
           args.common.logger.error({
             service: "database",
             msg: `Failed to update heartbeat timestamp, retrying in ${formatEta(
@@ -883,123 +1069,69 @@ export const createDatabase = async (args: {
 
       return { checkpoint: result.checkpoint };
     },
-    // async createIndexes() {
-    //   await Promise.all(
-    //     Object.entries(getTables(args.schema)).flatMap(([tableName, table]) => {
-    //       if (table.constraints === undefined) return [];
+    async createIndexes() {
+      await Promise.all(
+        Object.entries(getTables(args.schema)).flatMap(([tableName, table]) => {
+          if (table.constraints === undefined) return [];
 
-    //       return Object.entries(table.constraints).map(
-    //         async ([name, index]) => {
-    //           await qb.internal.wrap({ method: "createIndexes" }, async () => {
-    //             const indexName = `${tableName}_${name}`;
+          return Object.entries(table.constraints).map(
+            async ([name, index]) => {
+              await qb.internal.wrap({ method: "createIndexes" }, async () => {
+                const indexName = `${tableName}_${name}`;
 
-    //             const indexColumn = index[" column"];
-    //             const order = index[" order"];
-    //             const nulls = index[" nulls"];
+                const indexColumn = index[" column"];
+                const order = index[" order"];
+                const nulls = index[" nulls"];
 
-    //             if (dialect === "sqlite") {
-    //               const columns = Array.isArray(indexColumn)
-    //                 ? indexColumn.map((ic) => `"${ic}"`).join(", ")
-    //                 : `"${indexColumn}" ${order === "asc" ? "ASC" : order === "desc" ? "DESC" : ""}`;
+                if (dialect === "sqlite") {
+                  const columns = Array.isArray(indexColumn)
+                    ? indexColumn.map((ic) => `"${ic}"`).join(", ")
+                    : `"${indexColumn}" ${order === "asc" ? "ASC" : order === "desc" ? "DESC" : ""}`;
 
-    //               await qb.internal.executeQuery(
-    //                 sql`CREATE INDEX ${sql.ref(indexName)} ON ${sql.table(
-    //                   tableName,
-    //                 )} (${sql.raw(columns)})`.compile(qb.internal),
-    //               );
-    //             } else {
-    //               const columns = Array.isArray(indexColumn)
-    //                 ? indexColumn.map((ic) => `"${ic}"`).join(", ")
-    //                 : `"${indexColumn}" ${order === "asc" ? "ASC" : order === "desc" ? "DESC" : ""} ${
-    //                     nulls === "first"
-    //                       ? "NULLS FIRST"
-    //                       : nulls === "last"
-    //                         ? "NULLS LAST"
-    //                         : ""
-    //                   }`;
+                  await qb.internal.executeQuery(
+                    sql`CREATE INDEX ${sql.ref(indexName)} ON ${sql.table(
+                      tableName,
+                    )} (${sql.raw(columns)})`.compile(qb.internal),
+                  );
+                } else {
+                  const columns = Array.isArray(indexColumn)
+                    ? indexColumn.map((ic) => `"${ic}"`).join(", ")
+                    : `"${indexColumn}" ${order === "asc" ? "ASC" : order === "desc" ? "DESC" : ""} ${
+                        nulls === "first"
+                          ? "NULLS FIRST"
+                          : nulls === "last"
+                            ? "NULLS LAST"
+                            : ""
+                      }`;
 
-    //               await qb.internal.executeQuery(
-    //                 sql`CREATE INDEX ${sql.ref(indexName)} ON ${sql.table(
-    //                   `${namespace}.${tableName}`,
-    //                 )} (${sql.raw(columns)})`.compile(qb.internal),
-    //               );
-    //             }
-    //           });
+                  await qb.internal.executeQuery(
+                    sql`CREATE INDEX ${sql.ref(indexName)} ON ${sql.table(
+                      `${namespace}.${tableName}`,
+                    )} (${sql.raw(columns)})`.compile(qb.internal),
+                  );
+                }
+              });
 
-    //           args.common.logger.info({
-    //             service: "database",
-    //             msg: `Created index '${tableName}_${name}' on columns (${
-    //               Array.isArray(index[" column"])
-    //                 ? index[" column"].join(", ")
-    //                 : index[" column"]
-    //             }) in schema '${namespace}'`,
-    //           });
-    //         },
-    //       );
-    //     }),
-    //   );
-    // },
-    async createTriggers() {
-      await qb.internal.wrap({ method: "createTriggers" }, async () => {
-        const sqlTableNames = getSQLTableNames();
-        const jsTableNames = getJsTableNames();
-
-        for (let i = 0; i < sqlTableNames.length; i++) {
-          const jsTableName = jsTableNames[i]!;
-          const sqlTableName = sqlTableNames[i]!;
-
-          const columns = getTableColumns(args.schema[jsTableName]! as PgTable);
-
-          const columnNames = Object.values(columns).map(
-            (column) => `"${column.name}"`,
+              args.common.logger.info({
+                service: "database",
+                msg: `Created index '${tableName}_${name}' on columns (${
+                  Array.isArray(index[" column"])
+                    ? index[" column"].join(", ")
+                    : index[" column"]
+                }) in schema '${namespace}'`,
+              });
+            },
           );
-
-          await sql
-            .raw(`
-CREATE OR REPLACE FUNCTION ${sqlTableName}_reorg_operation()
-RETURNS TRIGGER AS $$
-BEGIN
-  IF TG_OP = 'INSERT' THEN
-    INSERT INTO "_ponder_reorg__${sqlTableName}" (${columnNames.join(",")}, operation, checkpoint) 
-    VALUES (${columnNames.map((name) => `NEW.${name}`).join(",")}, 0, '${encodeCheckpoint(maxCheckpoint)}');
-  ELSIF TG_OP = 'UPDATE' THEN
-    INSERT INTO "_ponder_reorg__${sqlTableName}" (${columnNames.join(",")}, operation, checkpoint) 
-    VALUES (${columnNames.map((name) => `OLD.${name}`).join(",")}, 1, '${encodeCheckpoint(maxCheckpoint)}');
-  ELSIF TG_OP = 'DELETE' THEN
-    INSERT INTO "_ponder_reorg__${sqlTableName}" (${columnNames.join(",")}, operation, checkpoint) 
-    VALUES (${columnNames.map((name) => `OLD.${name}`).join(",")}, 2, '${encodeCheckpoint(maxCheckpoint)}');   
-  END IF;
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql
-        `)
-            .execute(qb.internal);
-
-          await sql
-            .raw(`
-CREATE TRIGGER "${sqlTableName}_reorg"
-AFTER INSERT OR UPDATE OR DELETE ON "${namespace}"."${sqlTableName}"
-FOR EACH ROW EXECUTE FUNCTION ${sqlTableName}_reorg_operation();
-  `)
-            .execute(qb.internal);
-        }
-      });
+        }),
+      );
     },
     async revert({ checkpoint }) {
-      const sqlTableNames = getSQLTableNames();
-      const jsTableNames = getJsTableNames();
-
       await qb.internal.wrap({ method: "revert" }, () =>
         Promise.all(
-          sqlTableNames.map((sqlTableName, i) =>
-            qb.internal.transaction().execute((tx) =>
-              revert({
-                sqlTableName,
-                jsTableName: jsTableNames[i]!,
-                checkpoint,
-                tx,
-              }),
-            ),
+          Object.keys(getTables(args.schema)).map((tableName) =>
+            qb.internal
+              .transaction()
+              .execute((tx) => revert({ tableName, checkpoint, tx })),
           ),
         ),
       );
@@ -1010,14 +1142,15 @@ FOR EACH ROW EXECUTE FUNCTION ${sqlTableName}_reorg_operation();
           .updateTable("_ponder_meta")
           .where("key", "=", "app")
           .set({
-            value: sql`jsonb_set(value, '{checkpoint}', to_jsonb(${checkpoint}::varchar(75)))`,
+            value:
+              dialect === "sqlite"
+                ? sql`json_set(value, '$.checkpoint', ${checkpoint})`
+                : sql`jsonb_set(value, '{checkpoint}', to_jsonb(${checkpoint}::varchar(75)))`,
           })
           .execute();
 
-        const tableNames = getSQLTableNames();
-
         await Promise.all(
-          tableNames.map((tableName) =>
+          Object.keys(getTables(args.schema)).map((tableName) =>
             qb.internal
               .deleteFrom(`_ponder_reorg__${tableName}`)
               .where("checkpoint", "<=", checkpoint)
@@ -1033,21 +1166,6 @@ FOR EACH ROW EXECUTE FUNCTION ${sqlTableName}_reorg_operation();
         msg: `Updated finalized checkpoint to (timestamp=${decoded.blockTimestamp} chainId=${decoded.chainId} block=${decoded.blockNumber})`,
       });
     },
-    async complete({ checkpoint }) {
-      const tableNames = getSQLTableNames();
-
-      await Promise.all(
-        tableNames.map((tableName) =>
-          qb.internal.wrap({ method: "complete" }, async () => {
-            await qb.internal
-              .updateTable(`_ponder_reorg__${tableName}`)
-              .set({ checkpoint })
-              .where("checkpoint", "=", encodeCheckpoint(maxCheckpoint))
-              .execute();
-          }),
-        ),
-      );
-    },
     async kill() {
       clearInterval(heartbeatInterval);
 
@@ -1055,7 +1173,10 @@ FOR EACH ROW EXECUTE FUNCTION ${sqlTableName}_reorg_operation();
         .updateTable("_ponder_meta")
         .where("key", "=", "app")
         .set({
-          value: sql`jsonb_set(value, '{is_locked}', to_jsonb(0))`,
+          value:
+            dialect === "sqlite"
+              ? sql`json_set(value, '$.is_locked', 0)`
+              : sql`jsonb_set(value, '{is_locked}', to_jsonb(0))`,
         })
         .execute();
 
@@ -1069,17 +1190,22 @@ FOR EACH ROW EXECUTE FUNCTION ${sqlTableName}_reorg_operation();
       await qb.readonly.destroy();
       await qb.sync.destroy();
 
-      if (dialect === "pglite") {
-        const d = driver as PGliteDriver;
-        await d.instance.close();
-      }
-
-      if (dialect === "postgres") {
-        const d = driver as PostgresDriver;
-        await d.internal.end();
-        await d.user.end();
-        await d.readonly.end();
-        await d.sync.end();
+      if (dialect === "sqlite") {
+        // @ts-ignore
+        driver.user.close();
+        // @ts-ignore
+        driver.readonly.close();
+        // @ts-ignore
+        driver.sync.close();
+      } else {
+        // @ts-ignore
+        await driver.internal.end();
+        // @ts-ignore
+        await driver.user.end();
+        // @ts-ignore
+        await driver.readonly.end();
+        // @ts-ignore
+        await driver.sync.end();
       }
 
       args.common.logger.debug({
