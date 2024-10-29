@@ -272,7 +272,7 @@ export const createRealtimeSync = (
     } else {
       args.common.logger.info({
         service: "realtime",
-        msg: `Synced block ${hexToNumber(block.number)} from '${args.network.name}' `,
+        msg: `Synced'${args.network.name}' block ${hexToNumber(block.number)}`,
       });
     }
 

@@ -281,6 +281,13 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
         historicalSync,
       });
 
+      if (cached !== undefined) {
+        args.common.logger.debug({
+          service: "sync",
+          msg: `Found cached '${network.name}' progress up to block ${hexToNumber(cached.number)}`,
+        });
+      }
+
       // Update "ponder_sync_block" metric
       if (cached !== undefined) {
         args.common.metrics.ponder_sync_block.set(
@@ -1148,6 +1155,11 @@ export async function* localHistoricalSyncGenerator({
 
     const syncBlock = await historicalSync.sync(interval);
 
+    common.logger.debug({
+      service: "sync",
+      msg: `Synced '${network.name}' from block ${interval[0]} to ${interval[1]}`,
+    });
+
     // Update cursor to record progress
     fromBlock = interval[1] + 1;
 
@@ -1198,6 +1210,10 @@ export async function* localHistoricalSyncGenerator({
     yield;
 
     if (isSyncEnd(syncProgress) || isSyncFinalized(syncProgress)) {
+      common.logger.debug({
+        service: "sync",
+        msg: `Completed '${network.name}' historical sync from block ${totalInterval[0]} to ${totalInterval[1]}`,
+      });
       return;
     }
   }
